@@ -1,13 +1,15 @@
 // server.js — Penales 1v1 (Node + Express + Socket.IO)
 // Run: npm run dev   (o  npm start)
 // Endpoints:
-//   GET /health       -> ok
-//   GET /matches      -> lista de partidas públicas (para "Ver Partidos")
+//   GET /            -> info
+//   GET /health      -> ok
+//   GET /matches     -> lista de partidas públicas (para "Ver Partidos")
 
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
+const { randomUUID } = require('crypto');
 
 const PORT = process.env.PORT || 3001;
 const app = express();
@@ -16,7 +18,10 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*' }
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  // Android usa io.socket:socket.io-client:2.x (Engine.IO v3)
+  // Esto permite compatibilidad con server Socket.IO 4.x
+  allowEIO3: true,
 });
 
 // ======= Modelo en memoria (MVP) =======
@@ -24,7 +29,7 @@ const io = new Server(server, {
  * matches[matchId] = {
  *   id, status: 'waiting'|'playing'|'finished',
  *   type: 'public'|'private',
- *   code: 'ABCD12' | null,         // para desafíos
+ *   code: 'ABCD12' | null,
  *   players: { A: socketId|null, B: socketId|null },
  *   uids: { A: null|uid, B: null|uid },
  *   spectators: Set<socketId>,
@@ -38,8 +43,11 @@ const matches = {};
 const queue = []; // jugadores esperando "Jugar Rápido"
 const socketsMeta = new Map(); // socketId -> { uid, nick, matchId, role: 'A'|'B'|'spec' }
 
-function uid() {
-  return Math.random().toString(36).slice(2, 8) + Math.random().toString(36).slice(2, 6);
+// --- helpers ---
+function genId() {
+  // ID corto y único para partidas/guests
+  // (randomUUID está en Node 16+; Railway usa versiones modernas)
+  return randomUUID().slice(0, 8);
 }
 function inviteCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -58,17 +66,18 @@ function publicMatchesSnapshot() {
       round: m.round,
       maxRounds: m.maxRounds,
       score: m.score,
-      spectators: m.spectators.size
+      spectators: m.spectators.size,
     }));
 }
 
 // ======= REST mínimo (para “Ver Partidos”) =======
+app.get('/', (_req, res) => res.json({ name: 'KickOff server', ok: true }));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/matches', (_req, res) => res.json(publicMatchesSnapshot()));
 
 // ======= Lógica de juego =======
 function createMatch(type = 'public') {
-  const id = uid();
+  const id = genId();
   matches[id] = {
     id,
     status: 'waiting',
@@ -81,7 +90,7 @@ function createMatch(type = 'public') {
     maxRounds: 5,
     score: { A: 0, B: 0 },
     turn: 'A',
-    pending: { kick: null, dive: null }
+    pending: { kick: null, dive: null },
   };
   return matches[id];
 }
@@ -96,12 +105,10 @@ function startIfReady(m) {
 }
 
 function pushTurn(m) {
-  // avisa roles del turno actual
   const kickerId = m.players[m.turn];
   const keeperId = m.players[other(m.turn)];
   io.to(kickerId).emit('your_turn', { role: 'kicker', round: m.round, youAre: m.turn, score: m.score });
   io.to(keeperId).emit('your_turn', { role: 'keeper', round: m.round, youAre: other(m.turn), score: m.score });
-  // espectadores reciben estado
   for (const s of m.spectators) {
     io.to(s).emit('score_update', { score: m.score, round: m.round, turn: m.turn });
   }
@@ -113,19 +120,18 @@ function resolveShot(m) {
   m.pending.kick = null;
   m.pending.dive = null;
 
-  // Modelo simple de física/probabilidad:
-  const angle = Math.max(-60, Math.min(60, kick.angleDeg));
-  const power = Math.max(0, Math.min(1, kick.power01));
-  const spread = 6 * (0.2 + power);                     // más power => menos precisión
+  const angle = Math.max(-60, Math.min(60, Number(kick.angleDeg) || 0));
+  const power = Math.max(0, Math.min(1, Number(kick.power01) || 0));
+  const spread = 6 * (0.2 + power);
   const actualAngle = angle + (Math.random() * 2 - 1) * spread;
   const zone = actualAngle < -15 ? 'left' : actualAngle > 15 ? 'right' : 'center';
-  const missProb = Math.max(0, power - 0.9) * 2;        // muy fuerte => puede ir afuera
+  const missProb = Math.max(0, power - 0.9) * 2;
   const isMiss = Math.random() < missProb;
 
   let result = 'goal';
   if (isMiss) result = 'miss';
-  else if (dive.dir === zone) {
-    const saveProb = 0.6 - 0.25 * power;                // más power => más difícil atajar
+  else if (dive && dive.dir === zone) {
+    const saveProb = 0.6 - 0.25 * power;
     if (Math.random() < saveProb) result = 'save';
   }
 
@@ -133,28 +139,23 @@ function resolveShot(m) {
   const keeper = other(m.turn);
   if (result === 'goal') m.score[shooter] += 1;
 
-  // broadcast a jugadores y espectadores
   io.to(m.players.A).emit('shot_result', { result, zone, score: m.score, round: m.round, nextTurn: keeper });
   io.to(m.players.B).emit('shot_result', { result, zone, score: m.score, round: m.round, nextTurn: keeper });
   for (const s of m.spectators) io.to(s).emit('shot_result', { result, zone, score: m.score, round: m.round, nextTurn: keeper });
 
-  // avanzar ronda/turno
-  if (shooter === 'B') m.round += 1; // cada dos tiros sube la ronda
+  if (shooter === 'B') m.round += 1;
   m.turn = other(m.turn);
 
-  // ¿fin?
   const max = m.maxRounds;
   const totalShots = (m.round - 1) * 2 + (m.turn === 'A' ? 0 : 1);
   const maxShots = max * 2;
 
-  // muerte súbita después de 5/5 si empatan
   if (totalShots >= maxShots) {
     if (m.score.A !== m.score.B) {
       finishMatch(m);
       return;
     } else if (m.round > max) {
-      // en muerte súbita: si tras el par de tiros se sacan diferencia, termina
-      if (m.turn === 'A') { // acabamos de cerrar el par
+      if (m.turn === 'A') {
         if (m.score.A !== m.score.B) { finishMatch(m); return; }
       }
     }
@@ -174,12 +175,20 @@ function finishMatch(m) {
 io.on('connection', (socket) => {
   socketsMeta.set(socket.id, { uid: null, nick: null, matchId: null, role: null });
 
-  socket.on('hello', ({ uid, nick }) => {
+  // Handshake
+  socket.on('hello', (payload) => {
+    const data = payload || {};
+    // Si llega JSONObject.NULL desde Android, se convierte en null
+    const rawUid = (typeof data.uid === 'string') ? data.uid : '';
+    const nick = (typeof data.nick === 'string' && data.nick.trim()) ? data.nick.trim() : 'Invitado';
+    const finalUid = rawUid || ('guest_' + genId());
+
     const meta = socketsMeta.get(socket.id) || {};
-    meta.uid = uid || ('guest_' + uid());
-    meta.nick = nick || 'Invitado';
+    meta.uid = finalUid;
+    meta.nick = nick;
     socketsMeta.set(socket.id, meta);
-    socket.emit('hello_ok', { serverTime: Date.now() });
+
+    socket.emit('hello_ok', { serverTime: Date.now(), uid: finalUid, nick });
   });
 
   // Jugar Rápido (public)
@@ -189,14 +198,17 @@ io.on('connection', (socket) => {
 
     queue.push(socket.id);
 
-    // si hay 2 en cola -> crear/llenar partida
     while (queue.length >= 2) {
       const sA = queue.shift();
       const sB = queue.shift();
       const m = createMatch('public');
       m.players.A = sA; m.players.B = sB;
-      socketsMeta.get(sA).matchId = m.id; socketsMeta.get(sA).role = 'A';
-      socketsMeta.get(sB).matchId = m.id; socketsMeta.get(sB).role = 'B';
+      const metaA = socketsMeta.get(sA) || {};
+      const metaB = socketsMeta.get(sB) || {};
+      metaA.matchId = m.id; metaA.role = 'A';
+      metaB.matchId = m.id; metaB.role = 'B';
+      socketsMeta.set(sA, metaA);
+      socketsMeta.set(sB, metaB);
       startIfReady(m);
     }
   });
@@ -248,7 +260,7 @@ io.on('connection', (socket) => {
     if (m.players[m.turn] !== socket.id) return; // no es tu turno de patear
     m.pending.kick = {
       angleDeg: Number(angleDeg) || 0,
-      power01: Math.max(0, Math.min(1, Number(power01)))
+      power01: Math.max(0, Math.min(1, Number(power01))),
     };
     if (m.pending.kick && m.pending.dive) resolveShot(m);
   });
@@ -269,9 +281,11 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     const meta = socketsMeta.get(socket.id);
     socketsMeta.delete(socket.id);
+
     // quitar de queue
     const idx = queue.indexOf(socket.id);
     if (idx >= 0) queue.splice(idx, 1);
+
     // si estaba en un match, finalizar
     if (meta && meta.matchId) {
       const m = matches[meta.matchId];
